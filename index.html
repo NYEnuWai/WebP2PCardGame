@@ -188,124 +188,45 @@
     }
 
     // --- SDP compression ---
-    // Extract only essential fields from SDP, compress with deflate, base64url encode
+    // Strip unnecessary lines from SDP, deflate compress, base64url encode.
+    // Original SDP format is preserved (no reconstruction) for maximum compatibility.
 
-    function minifySDP(sdpObj) {
-      const sdp = sdpObj.sdp;
-      const lines = sdp.split('\r\n');
-      const compact = {
-        t: sdpObj.type === 'offer' ? 'o' : 'a',
-      };
+    // Lines essential for DataChannel-only WebRTC connection
+    const KEEP_PREFIXES = [
+      'v=', 'o=', 's=', 't=', 'a=group:', 'a=msid-semantic:',
+      'm=application', 'c=', 'a=ice-ufrag:', 'a=ice-pwd:',
+      'a=ice-options:', 'a=fingerprint:', 'a=setup:', 'a=mid:',
+      'a=sctp-port:', 'a=max-message-size:', 'a=candidate:',
+      'a=end-of-candidates', 'a=extmap-allow-mixed',
+    ];
 
-      const candidates = [];
-
-      for (const line of lines) {
-        if (line.startsWith('a=ice-ufrag:')) {
-          compact.u = line.slice(12);
-        } else if (line.startsWith('a=ice-pwd:')) {
-          compact.p = line.slice(10);
-        } else if (line.startsWith('a=fingerprint:')) {
-          // "sha-256 AA:BB:CC..." -> store hash only (algorithm is always sha-256)
-          compact.f = line.slice(24); // skip "a=fingerprint:sha-256 "
-        } else if (line.startsWith('a=setup:')) {
-          // actpass=0, active=1, passive=2
-          const val = line.slice(8);
-          compact.s = val === 'actpass' ? 0 : val === 'active' ? 1 : 2;
-        } else if (line.startsWith('a=candidate:')) {
-          // Parse candidate line into compact form
-          const parts = line.slice(12).split(' ');
-          // parts: foundation component protocol priority ip port typ type [raddr addr rport port]
-          const c = {
-            // Only keep what's needed to reconstruct
-            i: parts[4],  // ip
-            o: parseInt(parts[5]),  // port
-            y: parts[7],  // type (host/srflx/prflx/relay)
-          };
-          // protocol: only note if tcp (udp is default)
-          if (parts[2].toLowerCase() === 'tcp') c.tc = 1;
-          // For srflx/relay, include raddr/rport
-          if (parts[7] !== 'host') {
-            const raddrIdx = parts.indexOf('raddr');
-            if (raddrIdx !== -1) {
-              c.ri = parts[raddrIdx + 1];
-              c.ro = parseInt(parts[raddrIdx + 3]); // rport value
-            }
-          }
-          candidates.push(c);
-        }
-      }
-
-      compact.c = candidates;
-      return compact;
+    function stripSDP(sdp) {
+      return sdp.split('\r\n')
+        .filter(line => line === '' || KEEP_PREFIXES.some(p => line.startsWith(p)))
+        .join('\r\n');
     }
 
-    function expandSDP(compact) {
-      const type = compact.t === 'o' ? 'offer' : 'answer';
-      const setup = compact.s === 0 ? 'actpass' : compact.s === 1 ? 'active' : 'passive';
-
-      // Reconstruct minimal valid SDP
-      let sdp = [
-        'v=0',
-        'o=- 1 1 IN IP4 0.0.0.0',
-        's=-',
-        't=0 0',
-        'a=group:BUNDLE 0',
-        'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
-        'c=IN IP4 0.0.0.0',
-        `a=ice-ufrag:${compact.u}`,
-        `a=ice-pwd:${compact.p}`,
-        `a=fingerprint:sha-256 ${compact.f}`,
-        `a=setup:${setup}`,
-        'a=mid:0',
-        'a=sctp-port:5000',
-        'a=max-message-size:262144',
-      ];
-
-      // Reconstruct candidate lines
-      let idx = 0;
-      for (const c of compact.c) {
-        const proto = c.tc ? 'tcp' : 'udp';
-        const priority = c.y === 'host' ? 2130706431 : c.y === 'srflx' ? 1694498815 : 100;
-        let line = `a=candidate:${idx} 1 ${proto} ${priority} ${c.i} ${c.o} typ ${c.y}`;
-        if (c.y !== 'host' && c.ri !== undefined) {
-          line += ` raddr ${c.ri} rport ${c.ro}`;
-        }
-        sdp.push(line);
-        idx++;
-      }
-
-      sdp.push(''); // trailing newline
-      return { type, sdp: sdp.join('\r\n') };
-    }
-
-    async function compress(data) {
-      const json = JSON.stringify(data);
-      const blob = new Blob([json]);
+    async function deflate(text) {
+      const blob = new Blob([text]);
       const cs = new CompressionStream('deflate-raw');
-      const stream = blob.stream().pipeThrough(cs);
-      const buf = await new Response(stream).arrayBuffer();
-      // base64url encode (no padding, URL-safe)
-      const bytes = new Uint8Array(buf);
-      let b64 = btoa(String.fromCharCode(...bytes));
+      const buf = await new Response(blob.stream().pipeThrough(cs)).arrayBuffer();
+      let b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
       return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     }
 
-    async function decompress(encoded) {
-      // base64url decode
+    async function inflate(encoded) {
       let b64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
       while (b64.length % 4) b64 += '=';
-      const binary = atob(b64);
-      const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-      const blob = new Blob([bytes]);
+      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
       const ds = new DecompressionStream('deflate-raw');
-      const stream = blob.stream().pipeThrough(ds);
-      const text = await new Response(stream).text();
-      return JSON.parse(text);
+      return await new Response(new Blob([bytes]).stream().pipeThrough(ds)).text();
     }
 
     async function encodeSDP(sdpObj) {
-      const compact = minifySDP(sdpObj);
-      const encoded = await compress(compact);
+      const stripped = stripSDP(sdpObj.sdp);
+      // Pack type + sdp into a single string: "o|..." or "a|..."
+      const packed = (sdpObj.type === 'offer' ? 'o' : 'a') + '|' + stripped;
+      const encoded = await deflate(packed);
       // Show compression stats
       const origSize = btoa(JSON.stringify(sdpObj)).length;
       const sizeEl = document.getElementById('sdp-size');
@@ -314,8 +235,11 @@
     }
 
     async function decodeSDP(encoded) {
-      const compact = await decompress(encoded);
-      return expandSDP(compact);
+      const packed = await inflate(encoded);
+      const sep = packed.indexOf('|');
+      const type = packed[0] === 'o' ? 'offer' : 'answer';
+      const sdp = packed.slice(sep + 1);
+      return { type, sdp };
     }
 
     async function createOffer() {
