@@ -188,23 +188,7 @@
     }
 
     // --- SDP compression ---
-    // Strip unnecessary lines from SDP, deflate compress, base64url encode.
-    // Original SDP format is preserved (no reconstruction) for maximum compatibility.
-
-    // Lines essential for DataChannel-only WebRTC connection
-    const KEEP_PREFIXES = [
-      'v=', 'o=', 's=', 't=', 'a=group:', 'a=msid-semantic:',
-      'm=application', 'c=', 'a=ice-ufrag:', 'a=ice-pwd:',
-      'a=ice-options:', 'a=fingerprint:', 'a=setup:', 'a=mid:',
-      'a=sctp-port:', 'a=max-message-size:', 'a=candidate:',
-      'a=end-of-candidates', 'a=extmap-allow-mixed',
-    ];
-
-    function stripSDP(sdp) {
-      return sdp.split('\r\n')
-        .filter(line => line === '' || KEEP_PREFIXES.some(p => line.startsWith(p)))
-        .join('\r\n');
-    }
+    // Deflate compress + base64url encode. SDP is not modified at all.
 
     async function deflate(text) {
       const blob = new Blob([text]);
@@ -223,23 +207,18 @@
     }
 
     async function encodeSDP(sdpObj) {
-      const stripped = stripSDP(sdpObj.sdp);
-      // Pack type + sdp into a single string: "o|..." or "a|..."
-      const packed = (sdpObj.type === 'offer' ? 'o' : 'a') + '|' + stripped;
-      const encoded = await deflate(packed);
+      const json = JSON.stringify(sdpObj);
+      const encoded = await deflate(json);
       // Show compression stats
-      const origSize = btoa(JSON.stringify(sdpObj)).length;
+      const origSize = btoa(json).length;
       const sizeEl = document.getElementById('sdp-size');
       sizeEl.textContent = `${encoded.length}文字 (圧縮前: ${origSize}文字 → ${Math.round((1 - encoded.length / origSize) * 100)}%削減)`;
       return encoded;
     }
 
     async function decodeSDP(encoded) {
-      const packed = await inflate(encoded);
-      const sep = packed.indexOf('|');
-      const type = packed[0] === 'o' ? 'offer' : 'answer';
-      const sdp = packed.slice(sep + 1);
-      return { type, sdp };
+      const json = await inflate(encoded);
+      return JSON.parse(json);
     }
 
     async function createOffer() {
