@@ -404,22 +404,91 @@
       return { compress: compressToEncodedURIComponent, decompress: decompressFromEncodedURIComponent };
     })();
 
+    // SDPのうち毎回同一の固定行（圧縮前に除去し、展開時に復元する）
+    const SDP_FIXED_LINES = [
+      'v=0',
+      's=-',
+      't=0 0',
+      'a=group:BUNDLE 0',
+      'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
+      'c=IN IP4 0.0.0.0',
+      'a=mid:0',
+      'a=sctp-port:5000',
+    ];
+
+    // candidate行を短縮: 接続に必要な部分だけ残す
+    // 元: "a=candidate:1234 1 udp 2113937151 192.168.1.5 12345 typ host generation 0 ufrag abc1 network-cost 999"
+    // 短: "~1234 1 udp 2113937151 192.168.1.5 12345 typ host"
+    function shortenCandidate(line) {
+      const full = line.slice(12); // remove "a=candidate:"
+      // "generation" 以降はブラウザ固有の拡張情報で、接続には不要
+      const genIdx = full.indexOf(' generation');
+      const tcpIdx = full.indexOf(' tcptype');
+      let trimmed = full;
+      if (genIdx !== -1) trimmed = full.slice(0, genIdx);
+      // tcptype は TCP candidate で必要なので残す
+      if (tcpIdx !== -1 && tcpIdx < (genIdx === -1 ? full.length : genIdx)) {
+        const afterTcp = full.slice(tcpIdx);
+        const genInTcp = afterTcp.indexOf(' generation');
+        trimmed = full.slice(0, tcpIdx) + (genInTcp !== -1 ? afterTcp.slice(0, genInTcp) : afterTcp);
+      }
+      return '~' + trimmed;
+    }
+
+    function restoreCandidate(short) {
+      return 'a=candidate:' + short.slice(1);
+    }
+
+    function packSDP(sdpObj) {
+      const prefix = sdpObj.type === 'offer' ? 'o' : 'a';
+      const lines = sdpObj.sdp.split('\r\n');
+      const kept = [];
+      for (const line of lines) {
+        if (!line || SDP_FIXED_LINES.includes(line)) continue;
+        if (line.startsWith('a=candidate:')) {
+          kept.push(shortenCandidate(line));
+        } else {
+          kept.push(line);
+        }
+      }
+      return prefix + '\n' + kept.join('\n');
+    }
+
+    function unpackSDP(packed) {
+      const type = packed[0] === 'o' ? 'offer' : 'answer';
+      const lines = packed.slice(2).split('\n');
+
+      // SDPの正しい順序で復元
+      const restored = [...SDP_FIXED_LINES];
+      const candidates = [];
+      for (const line of lines) {
+        if (line.startsWith('~')) {
+          candidates.push(restoreCandidate(line));
+        } else if (line) {
+          restored.push(line);
+        }
+      }
+      // candidate行は末尾にまとめる
+      restored.push(...candidates);
+      restored.push(''); // 末尾の空行
+      return { type, sdp: restored.join('\r\n') };
+    }
+
     function encodeSDP(sdpObj) {
-      const json = JSON.stringify(sdpObj);
-      const encoded = LZ.compress(json);
+      const packed = packSDP(sdpObj);
+      const encoded = LZ.compress(packed);
       // Show compression stats
-      const origSize = btoa(json).length;
+      const origSize = btoa(JSON.stringify(sdpObj)).length;
       const sizeEl = document.getElementById('sdp-size');
-      sizeEl.textContent = `${encoded.length}文字 (圧縮前: ${origSize}文字 → ${Math.round((1 - encoded.length / origSize) * 100)}%削減)`;
+      sizeEl.textContent = `${encoded.length}文字 (元のBase64: ${origSize}文字 → ${Math.round((1 - encoded.length / origSize) * 100)}%削減)`;
       return encoded;
     }
 
     function decodeSDP(encoded) {
-      // Remove any whitespace/newlines that chat apps might add
       const cleaned = encoded.replace(/\s/g, '');
-      const json = LZ.decompress(cleaned);
-      if (!json) throw new Error('展開に失敗しました');
-      return JSON.parse(json);
+      const packed = LZ.decompress(cleaned);
+      if (!packed) throw new Error('展開に失敗しました');
+      return unpackSDP(packed);
     }
 
     async function createOffer() {
